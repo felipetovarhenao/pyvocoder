@@ -8,7 +8,7 @@ TWO_PI: float = PI * 2
 
 class PV:
 
-    def __init__(self, hop_length: int = 512, win_length: int = 2048) -> None:
+    def __init__(self, hop_length: int = 128, win_length: int = 1024) -> None:
         self.hop_length: int = hop_length
         self.win_length: int = win_length
         self.nyquist_index: int = self.win_length // 2 + 1
@@ -18,16 +18,22 @@ class PV:
         self.prev_input_phase: np.ndarray = np.zeros(self.nyquist_index)
         self.prev_output_phase: np.ndarray = np.zeros(self.nyquist_index)
 
-    def retune(self, path: str, fq: float = 220) -> tuple[np.ndarray, int]:
+    def retune(self, path: str, semitones: float = 220) -> tuple[np.ndarray, int]:
         input_signal, sr = librosa.load(path=path, sr=None, mono=True)
-
-        base_frequency = fq
-        base_radian_frequency = (base_frequency/sr) * TWO_PI
 
         num_frames: int = (len(input_signal) - self.win_length) // self.hop_length
 
         # output signal array
         output_signal: np.ndarray = np.zeros_like(input_signal)
+
+        detected_frequencies = librosa.yin(y=input_signal,
+                                           fmin=50,
+                                           fmax=1200,
+                                           frame_length=self.win_length,
+                                           hop_length=self.hop_length)[:num_frames]
+
+        factor = 2**(semitones/12)
+        quantized_frequencies = self.quantize_frequencies(self.smooth_array(detected_frequencies) * factor)
 
         for i in range(num_frames):
             st: int = i * self.hop_length
@@ -35,6 +41,9 @@ class PV:
             input_frame: np.ndarray = input_signal[st:end] * self.windowing_function
 
             input_mag, input_frequencies = self.analyze_frame(frame=input_frame)
+
+            base_frequency = quantized_frequencies[i]
+            base_radian_frequency = (base_frequency/sr) * TWO_PI
 
             output_signal[st:end] += self.resynth_frame(input_mag=input_mag,
                                                         sr=sr,
@@ -62,7 +71,7 @@ class PV:
         output_mag: np.ndarray = np.zeros(self.nyquist_index)
         output_frequencies: np.ndarray = np.zeros(self.nyquist_index)
 
-        harmonic_raw = input_frequencies * sr / TWO_PI / base_frequency
+        harmonic_raw = (input_frequencies * sr) / (TWO_PI * base_frequency)
         harmonic_below = np.floor(harmonic_raw)
         harmonic_above = harmonic_below + 1
         harmonic_fraction = harmonic_raw-harmonic_below
@@ -83,8 +92,7 @@ class PV:
 
         # handle upper harmonic
         new_frequency = base_radian_frequency * harmonic_above
-        new_bin = np.round(
-            new_frequency * (self.win_length / TWO_PI)).astype('int32')
+        new_bin = np.round(new_frequency * (self.win_length / TWO_PI)).astype('int32')
 
         index_mask = np.argwhere(new_bin < self.nyquist_index)[:, 0]
         indices = self.bin_indices[index_mask]
@@ -110,19 +118,60 @@ class PV:
         output_frame = np.real(np.fft.ifft(a=output_spectrum))
         return output_frame * self.windowing_function
 
-    @staticmethod
+    def quantize_frequencies(self, frequencies, pitch_class_list=np.array([0, 3, 7])):
+        pitches = np.zeros_like(frequencies)
+        positive_indices = np.argwhere(frequencies > 0)[:, 0]
+        pitches[positive_indices] = self.freq_to_pitch(frequencies[positive_indices])
+        quantized_pitches = np.array([self.quantize_pitch(p, pitch_class_list) for p in pitches])
+        quantized_frequencies = np.zeros_like(frequencies)
+        quantized_frequencies[positive_indices] = self.pitch_to_freq(quantized_pitches[positive_indices])
+        return quantized_frequencies
+
+    def quantize_pitch(self, pitch: float, pitch_grid):
+        if pitch == 0:
+            return pitch
+        pitch_class = pitch % 12
+        pitch_dist = np.minimum(np.abs(pitch_grid - pitch_class), 12 - np.abs(pitch_grid - pitch_class))
+        nearest_pitch_class = pitch_grid[np.argmin(pitch_dist)]
+        return np.round(pitch - pitch_class + nearest_pitch_class)
+
+    @ staticmethod
     def split_frame(frame: np.ndarray) -> np.ndarray:
         return frame[:len(frame) // 2 + 1]
 
-    @staticmethod
+    @ staticmethod
     def mirror_frame(frame: np.ndarray, is_phase: bool = False) -> np.ndarray:
         return np.concatenate([frame[:-1], (-1 if is_phase else 1) * np.flip(frame[1:])])
 
-    @staticmethod
+    @ staticmethod
     def wrap_phase(phase: np.ndarray) -> np.ndarray:
         return np.mod(phase+PI, TWO_PI) - PI
 
+    @ staticmethod
+    def freq_to_pitch(freq_array):
+        return 12 * np.log2(freq_array / 440) + 69
+
+    @ staticmethod
+    def pitch_to_freq(pitch_array):
+        return 440 * 2 ** ((pitch_array - 69) / 12)
+
+    @ staticmethod
+    def smooth_array(arr, window_size: int = 11):
+        if window_size % 2 == 0:
+            raise ValueError("Window size must be an odd integer.")
+
+        # Create a new array to hold the smoothed values
+        smoothed_arr = np.zeros_like(arr)
+
+        # Apply the smoothing filter to each element in the array
+        for i in range(len(arr)):
+            left_idx = max(0, i - (window_size-1)//2)
+            right_idx = min(len(arr)-1, i + (window_size-1)//2)
+            smoothed_arr[i] = np.mean(arr[left_idx:right_idx+1])
+
+        return smoothed_arr
+
 
 p = PV()
-data, samplerate = p.retune('./input/i-do-not-know-who-i-am.wav', 660)
+data, samplerate = p.retune("./input/i can hear your voice mid h1.wav", 0)
 sf.write('./output/output.wav', data=data, samplerate=samplerate)
