@@ -45,11 +45,12 @@ class PV:
             base_frequency = quantized_frequencies[i]
             base_radian_frequency = (base_frequency/sr) * TWO_PI
 
-            output_signal[st:end] += self.resynth_frame(input_mag=input_mag,
-                                                        sr=sr,
-                                                        input_frequencies=input_frequencies,
-                                                        base_frequency=base_frequency,
-                                                        base_radian_frequency=base_radian_frequency)
+            output_mag, output_frequencies = self.process_frame(input_mag=input_mag,
+                                                                sr=sr,
+                                                                input_frequencies=input_frequencies,
+                                                                base_frequency=base_frequency,
+                                                                base_radian_frequency=base_radian_frequency)
+            output_signal[st:end] += self.resynth_frame(output_mag, output_frequencies)
 
         return output_signal, sr
 
@@ -67,7 +68,7 @@ class PV:
         self.prev_input_phase = input_phase
         return input_mag, input_frequencies
 
-    def resynth_frame(self, input_mag, sr,  input_frequencies, base_frequency, base_radian_frequency):
+    def process_frame(self, input_mag, sr,  input_frequencies, base_frequency, base_radian_frequency):
         output_mag: np.ndarray = np.zeros(self.nyquist_index)
         output_frequencies: np.ndarray = np.zeros(self.nyquist_index)
 
@@ -100,7 +101,9 @@ class PV:
         new_bin = new_bin[index_mask]
         output_mag[new_bin] += input_mag[indices] * harmonic_fraction[indices]
         output_frequencies[new_bin] = new_frequency[index_mask]
+        return output_mag, output_frequencies
 
+    def resynth_frame(self, output_mag, output_frequencies):
         # —————————— RESYNTH STAGE ————————————
         frequency_deviation = output_frequencies - self.bin_frequencies
         phase_diff = frequency_deviation * self.hop_length
@@ -111,7 +114,6 @@ class PV:
 
         self.prev_output_phase = output_phase
 
-        # resynthesis
         output_mag = self.mirror_frame(output_mag)
         output_phase = self.mirror_frame(output_phase, is_phase=True)
         output_spectrum = output_mag * np.exp(1j * output_phase)
