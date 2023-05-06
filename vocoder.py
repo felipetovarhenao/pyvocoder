@@ -1,6 +1,5 @@
 import numpy as np
 import librosa
-import soundfile as sf
 
 PI: float = np.pi
 TWO_PI: float = PI * 2
@@ -8,7 +7,7 @@ TWO_PI: float = PI * 2
 
 class PV:
 
-    def __init__(self, hop_length: int = 128, win_length: int = 1024) -> None:
+    def __init__(self, hop_length: int = 128, win_length: int = 2048) -> None:
         self.hop_length: int = hop_length
         self.win_length: int = win_length
         self.nyquist_index: int = self.win_length // 2 + 1
@@ -16,66 +15,95 @@ class PV:
         self.bin_indices = np.arange(self.nyquist_index)
         self.bin_frequencies: np.ndarray = TWO_PI * self.bin_indices / self.win_length
         self.prev_input_phase: np.ndarray = np.zeros(self.nyquist_index)
-        self.prev_output_phase: np.ndarray = np.zeros(self.nyquist_index)
+        self.prev_output_phases: np.ndarray | None = None
 
-    def retune(self, path: str, semitones: float = 220) -> tuple[np.ndarray, int]:
+    def retune(self, path: str, pitch_list: list = [60, 64, 67]) -> tuple[np.ndarray, int]:
+        """ Main function — applies robotization effect to input file and retunes it to `pitch_list` argument """
+        # load input file as an array
         input_signal, sr = librosa.load(path=path, sr=None, mono=True)
 
+        # number of overlapping FFT frames
         num_frames: int = (len(input_signal) - self.win_length) // self.hop_length
 
-        # output signal array
-        output_signal: np.ndarray = np.zeros_like(input_signal)
+        # initialize empty output audio signal array
+        output_signal: np.ndarray = np.zeros(shape=(len(input_signal), 2))
 
-        detected_frequencies = librosa.yin(y=input_signal,
-                                           fmin=50,
-                                           fmax=1200,
-                                           frame_length=self.win_length,
-                                           hop_length=self.hop_length)[:num_frames]
+        # convert pitch collection to frequency
+        frequency_list = self.pitch_to_freq(np.array(pitch_list))
 
-        factor = 2**(semitones/12)
-        quantized_frequencies = self.quantize_frequencies(self.smooth_array(detected_frequencies) * factor)
+        # shufle frequency array (for random stereo panning inside loop)
+        np.random.shuffle(frequency_list)
 
+        # initialize output phase buffer (one array per pitch)
+        self.prev_output_phases: np.ndarray = np.zeros(shape=(len(frequency_list), self.nyquist_index))
+
+        # analysis-resynthesis per FFT frame
         for i in range(num_frames):
+            # get index range and extract windowed frame
             st: int = i * self.hop_length
             end: int = st + self.win_length
             input_frame: np.ndarray = input_signal[st:end] * self.windowing_function
 
-            input_mag, input_frequencies = self.analyze_frame(frame=input_frame)
+            # get input magnitudes and frequencies from frame
+            input_mag, input_frequencies = self.__analyze_frame(frame=input_frame)
 
-            base_frequency = quantized_frequencies[i]
-            base_radian_frequency = (base_frequency/sr) * TWO_PI
+            # apply resynthesis for each target pitch
+            for n, base_frequency in enumerate(frequency_list):
+                # frequency in radians
+                base_radian_frequency = (base_frequency/sr) * TWO_PI
 
-            output_mag, output_frequencies = self.process_frame(input_mag=input_mag,
-                                                                sr=sr,
-                                                                input_frequencies=input_frequencies,
-                                                                base_frequency=base_frequency,
-                                                                base_radian_frequency=base_radian_frequency)
-            output_signal[st:end] += self.resynth_frame(output_mag, output_frequencies)
+                # panning value based on voice index
+                pan = n/(len(frequency_list)-1)
+                pan = np.array([1-pan, pan])
 
+                # get synthesis magnitudes and frequencies based on target pitch
+                output_mag, output_frequencies = self.__process_frame(input_mag=input_mag,
+                                                                      sr=sr,
+                                                                      input_frequencies=input_frequencies,
+                                                                      base_frequency=base_frequency,
+                                                                      base_radian_frequency=base_radian_frequency)
+
+                # resynthesize frame, apply panning, and add to output signal
+                output_frame = self.__resynth_frame(output_mag, output_frequencies, voice_index=n)
+                output_frame = np.repeat(output_frame[:, None], repeats=2, axis=1) * pan
+                output_signal[st:end] += output_frame
+
+        output_signal /= output_signal.max()
         return output_signal, sr
 
-    def analyze_frame(self, frame):
+    def __analyze_frame(self, frame):
+        # perform FFT analysis and get left half of magnitudes and phases
         input_spectrum: np.ndarray = np.fft.fft(a=frame)
         input_mag: np.ndarray = self.split_frame(np.abs(input_spectrum))
         input_phase: np.ndarray = self.split_frame(np.angle(input_spectrum))
 
+        # get current phase difference between adjacent FFT frames and wrap to [-pi, pi) range
         phase_diff: np.ndarray = input_phase - self.prev_input_phase
         phase_diff = self.wrap_phase(phase_diff - self.bin_frequencies * self.hop_length)
 
+        # get deviation from bins' center frequency
         frequency_deviation: np.ndarray = phase_diff / self.hop_length
 
+        # get true frequencies
         input_frequencies: np.ndarray = self.bin_frequencies + frequency_deviation
+
+        # keep track of phase for next FFT frame
         self.prev_input_phase = input_phase
+
         return input_mag, input_frequencies
 
-    def process_frame(self, input_mag, sr,  input_frequencies, base_frequency, base_radian_frequency):
+    def __process_frame(self, input_mag, sr,  input_frequencies, base_frequency, base_radian_frequency):
+        # initialize arrays for output magnitudes and frequencies
         output_mag: np.ndarray = np.zeros(self.nyquist_index)
         output_frequencies: np.ndarray = np.zeros(self.nyquist_index)
 
-        harmonic_raw = (input_frequencies * sr) / (TWO_PI * base_frequency)
+        # get float partial frequency by normalizing radians and mutiplying by fractional bin number of target frequency
+        harmonic_raw = (input_frequencies / TWO_PI) * (sr / base_frequency)
+
+        # get lower and upper bins, along with the fractional difference
         harmonic_below = np.floor(harmonic_raw)
         harmonic_above = harmonic_below + 1
-        harmonic_fraction = harmonic_raw-harmonic_below
+        harmonic_fraction = harmonic_raw - harmonic_below
 
         # handle lower harmonic
         harmonic_below_indices = np.argwhere(harmonic_below > 0)[:, 0]
@@ -103,16 +131,16 @@ class PV:
         output_frequencies[new_bin] = new_frequency[index_mask]
         return output_mag, output_frequencies
 
-    def resynth_frame(self, output_mag, output_frequencies):
+    def __resynth_frame(self, output_mag, output_frequencies, voice_index):
         # —————————— RESYNTH STAGE ————————————
         frequency_deviation = output_frequencies - self.bin_frequencies
         phase_diff = frequency_deviation * self.hop_length
 
         phase_diff += self.bin_frequencies * self.hop_length
 
-        output_phase = self.wrap_phase(self.prev_output_phase + phase_diff)
+        output_phase = self.wrap_phase(self.prev_output_phases[voice_index] + phase_diff)
 
-        self.prev_output_phase = output_phase
+        self.prev_output_phases[voice_index] = output_phase
 
         output_mag = self.mirror_frame(output_mag)
         output_phase = self.mirror_frame(output_phase, is_phase=True)
@@ -120,16 +148,17 @@ class PV:
         output_frame = np.real(np.fft.ifft(a=output_spectrum))
         return output_frame * self.windowing_function
 
-    def quantize_frequencies(self, frequencies, pitch_class_list=np.array([0, 3, 7])):
+    def __quantize_frequencies(self, frequencies, pitch_class_list=np.array([0, 3, 7])):
+        """ ignore this private method """
         pitches = np.zeros_like(frequencies)
-        positive_indices = np.argwhere(frequencies > 0)[:, 0]
+        positive_indices = np.argwhere(frequencies > 0)
         pitches[positive_indices] = self.freq_to_pitch(frequencies[positive_indices])
-        quantized_pitches = np.array([self.quantize_pitch(p, pitch_class_list) for p in pitches])
+        quantized_pitches = np.array([self.__quantize_pitch(p, pitch_class_list) for p in pitches])
         quantized_frequencies = np.zeros_like(frequencies)
         quantized_frequencies[positive_indices] = self.pitch_to_freq(quantized_pitches[positive_indices])
         return quantized_frequencies
 
-    def quantize_pitch(self, pitch: float, pitch_grid):
+    def __quantize_pitch(self, pitch: float, pitch_grid):
         if pitch == 0:
             return pitch
         pitch_class = pitch % 12
@@ -172,8 +201,3 @@ class PV:
             smoothed_arr[i] = np.mean(arr[left_idx:right_idx+1])
 
         return smoothed_arr
-
-
-p = PV()
-data, samplerate = p.retune("./input/i can hear your voice mid h1.wav", 0)
-sf.write('./output/output.wav', data=data, samplerate=samplerate)
